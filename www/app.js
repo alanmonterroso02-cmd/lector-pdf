@@ -571,6 +571,7 @@
           '<input type="range" id="set-bright" min="30" max="130" value="' + Math.round(s.brightness * 100) + '"></div>' +
         '<div class="slider-row"><label><span>Velocidad de lectura en voz alta</span><span id="rate-val">' + s.ttsRate.toFixed(1) + 'x</span></label>' +
           '<input type="range" id="set-rate" min="5" max="20" value="' + Math.round(s.ttsRate * 10) + '"></div>' +
+        '<button class="row" id="voice-row" style="width:100%;text-align:left"><div class="grow"><div class="t">Texto a voz</div><div class="d" id="voice-sub">Comprobando…</div></div><span class="chev">›</span></button>' +
         '<div class="sep"></div>' +
         '<div class="row" id="storage-row"><div class="grow"><div class="t">Almacenamiento usado</div><div class="d" id="storage-info">Calculando…</div></div></div>' +
         '<div class="sep"></div>' +
@@ -595,13 +596,17 @@
           el.querySelector('#rate-val').textContent = state.settings.ttsRate.toFixed(1) + 'x';
           saveSettings();
         });
+        el.querySelector('#voice-row').addEventListener('click', function () {
+          closeSheet();
+          openVoiceSheet();
+        });
         storageInfo(el.querySelector('#storage-info'));
+        refreshVoiceSummary(el);
       }
     });
   }
 
-  async function storageInfo(target) {
-    try {
+  async function storageInfo(target) {    try {
       if (navigator.storage && navigator.storage.estimate) {
         var est = await navigator.storage.estimate();
         var used = est.usage || 0;
@@ -612,6 +617,121 @@
     } catch (e) { }
     var total = state.books.reduce(function (a, b) { return a + (b.size || 0); }, 0);
     target.textContent = fmtBytes(total) + ' en ' + state.books.length + ' libros';
+  }
+
+  /* ---------------------------------------------------------
+     Voces del sistema (lectura sin conexión)
+  --------------------------------------------------------- */
+  async function refreshVoiceSummary(root) {
+    var sub = (root || document).querySelector('#voice-sub');
+    if (!sub) return;
+    try {
+      var list = await TTS.voices();
+      var base = String(state.settings.ttsLang || 'es').slice(0, 2).toLowerCase();
+      var r = await TTS.resolve();
+      var hayLocal = list.some(function (v) {
+        return String(v.lang || '').toLowerCase().indexOf(base) === 0 && v.localService;
+      });
+      var nombre = r && r.voice ? (r.voice.name || r.voice.lang) : 'voz del sistema';
+      sub.textContent = (hayLocal ? 'Sin conexión · ' : 'Necesita internet · ') + nombre;
+    } catch (e) {
+      sub.textContent = 'No se pudieron leer las voces';
+    }
+  }
+
+  function openVoiceSheet() {
+    openSheet({
+      title: 'Texto a voz',
+      body:
+        '<p class="note">Para leer en voz alta <b>sin internet</b>, Android necesita tener descargada la voz del idioma. ' +
+        'Si el teléfono solo tiene voces «online», la app lee igual pero necesitará conexión.</p>' +
+        '<button class="row" data-act="install" style="width:100%;text-align:left"><div class="grow">' +
+          '<div class="t">Descargar voces del sistema</div><div class="d">Abre los datos de voz de Android</div></div><span class="chev">›</span></button>' +
+        '<button class="row" data-act="auto" style="width:100%;text-align:left"><div class="grow">' +
+          '<div class="t">Automática</div><div class="d">Mejor voz sin conexión disponible</div></div><span class="chev" id="v-auto"></span></button>' +
+        '<div class="sep"></div>' +
+        '<div id="voice-list"><p class="note">Cargando voces…</p></div>',
+      onBody: function (el) {
+        el.addEventListener('click', async function (e) {
+          var install = e.target.closest('[data-act="install"]');
+          var auto = e.target.closest('[data-act="auto"]');
+          var row = e.target.closest('[data-uri]');
+
+          if (install) {
+            var p = window.Capacitor && window.Capacitor.Plugins && window.Capacitor.Plugins.TextToSpeech;
+            if (!p || !p.openInstall) {
+              toast('Ajustes → Sistema → Idiomas → Salida de texto a voz');
+              return;
+            }
+            try {
+              await p.openInstall();
+              toast('Instala la voz de español y vuelve aquí');
+            } catch (err) {
+              toast('Ajustes → Sistema → Idiomas → Salida de texto a voz');
+            }
+            return;
+          }
+
+          if (auto) {
+            state.settings.ttsVoiceURI = '';
+            saveSettings();
+            TTS.reset();
+            await refreshVoicesUI(el);
+            toast('Voz automática activada');
+            return;
+          }
+
+          if (row) {
+            state.settings.ttsVoiceURI = row.getAttribute('data-uri') || '';
+            state.settings.ttsLang = row.getAttribute('data-lang') || state.settings.ttsLang;
+            saveSettings();
+            TTS.reset();
+            await refreshVoicesUI(el);
+            toast('Voz seleccionada');
+          }
+        });
+
+        refreshVoicesUI(el);
+      }
+    });
+  }
+
+  async function refreshVoicesUI(el) {
+    var listEl = el.querySelector('#voice-list');
+    if (!listEl) return;
+    var autoMark = el.querySelector('#v-auto');
+    if (autoMark) autoMark.textContent = state.settings.ttsVoiceURI ? '' : '✓';
+
+    var list = await TTS.voices(true);
+    if (!list.length) {
+      listEl.innerHTML = '<p class="note">El teléfono no reportó voces. Revisa Ajustes → Sistema → Idiomas → Salida de texto a voz.</p>';
+      return;
+    }
+
+    var base = String(state.settings.ttsLang || 'es').slice(0, 2).toLowerCase();
+    var delIdioma = list.filter(function (v) {
+      return String(v.lang || '').toLowerCase().indexOf(base) === 0;
+    });
+    if (!delIdioma.length) delIdioma = list;
+
+    delIdioma.sort(function (a, b) {
+      if (!!a.localService !== !!b.localService) return a.localService ? -1 : 1;
+      return String(a.lang).localeCompare(String(b.lang));
+    });
+
+    var offline = delIdioma.filter(function (v) { return v.localService; }).length;
+
+    listEl.innerHTML =
+      '<p class="note">' + (offline
+        ? offline + ' voz(es) sin conexión disponibles.'
+        : 'Ninguna voz sin conexión para este idioma. Usa el botón de arriba para descargarla.') + '</p>' +
+      delIdioma.map(function (v) {
+        var sel = v.voiceURI === state.settings.ttsVoiceURI;
+        return '<button class="row" data-uri="' + esc(v.voiceURI) + '" data-lang="' + esc(v.lang) + '" style="width:100%;text-align:left">' +
+          '<div class="grow"><div class="t">' + esc(v.name || v.lang) + '</div>' +
+          '<div class="d">' + esc(v.lang) + ' · ' + (v.localService ? 'sin conexión' : 'requiere internet') + '</div></div>' +
+          (sel ? '<span class="chev">✓</span>' : '') + '</button>';
+      }).join('');
   }
 
   /* ---------------------------------------------------------
@@ -1102,17 +1222,106 @@
   --------------------------------------------------------- */
   var TTS = (function () {
     var playing = false, cancelled = false, curPage = 1, bar = null;
+    var voiceCache = null;
+    var resolved = null;
 
     function plugin() {
       return (window.Capacitor && window.Capacitor.Plugins && window.Capacitor.Plugins.TextToSpeech) || null;
     }
 
-    function webSpeak(text) {
+    /* Lista de voces del sistema. localService=true significa que funciona SIN internet. */
+    async function voices(force) {
+      if (voiceCache && !force) return voiceCache;
+      var p = plugin();
+      if (!p) {
+        if (window.speechSynthesis && window.speechSynthesis.getVoices) {
+          var web = window.speechSynthesis.getVoices();
+          if (!web.length) {
+            // Chrome carga las voces de forma asíncrona
+            await new Promise(function (res) {
+              var t = setTimeout(res, 700);
+              try {
+                window.speechSynthesis.onvoiceschanged = function () {
+                  clearTimeout(t);
+                  res();
+                };
+              } catch (e) { }
+            });
+            web = window.speechSynthesis.getVoices();
+          }
+          voiceCache = web.map(function (v) {
+            return { voiceURI: v.voiceURI, name: v.name, lang: v.lang, localService: v.localService !== false, default: v.default };
+          });
+        } else {
+          voiceCache = [];
+        }
+        return voiceCache;
+      }
+      try {
+        var r = await p.getSupportedVoices();
+        voiceCache = (r && r.voices) || [];
+      } catch (e) {
+        voiceCache = [];
+      }
+      resolved = null;
+      return voiceCache;
+    }
+
+    function baseLang() {
+      return String(state.settings.ttsLang || 'es-ES').slice(0, 2).toLowerCase();
+    }
+
+    /* Elige la mejor voz: la elegida a mano > una local del idioma > cualquiera del idioma */
+    function pickIndex(list) {
+      var i;
+      if (state.settings.ttsVoiceURI) {
+        for (i = 0; i < list.length; i++) {
+          if (list[i].voiceURI === state.settings.ttsVoiceURI) return i;
+        }
+      }
+      var base = baseLang();
+      for (i = 0; i < list.length; i++) {
+        if (String(list[i].lang || '').toLowerCase().indexOf(base) === 0 && list[i].localService) return i;
+      }
+      for (i = 0; i < list.length; i++) {
+        if (String(list[i].lang || '').toLowerCase().indexOf(base) === 0) return i;
+      }
+      return -1;
+    }
+
+    async function resolve() {
+      if (resolved) return resolved;
+      var list = await voices();
+      var idx = pickIndex(list);
+      resolved = {
+        index: idx,
+        voice: idx >= 0 ? list[idx] : null,
+        list: list
+      };
+      return resolved;
+    }
+
+    async function offlineAvailable() {
+      var list = await voices();
+      var base = baseLang();
+      for (var i = 0; i < list.length; i++) {
+        if (String(list[i].lang || '').toLowerCase().indexOf(base) === 0 && list[i].localService) return true;
+      }
+      return false;
+    }
+
+    function webSpeak(text, opts) {
       return new Promise(function (resolve) {
         if (!window.speechSynthesis) return resolve();
         var u = new SpeechSynthesisUtterance(text);
-        u.lang = state.settings.ttsLang;
-        u.rate = state.settings.ttsRate;
+        u.lang = opts.lang;
+        u.rate = opts.rate;
+        var all = window.speechSynthesis.getVoices();
+        if (opts.voiceURI) {
+          for (var i = 0; i < all.length; i++) {
+            if (all[i].voiceURI === opts.voiceURI) { u.voice = all[i]; break; }
+          }
+        }
         u.onend = resolve;
         u.onerror = resolve;
         window.speechSynthesis.speak(u);
@@ -1121,17 +1330,26 @@
 
     async function speak(text) {
       var p = plugin();
+      var r = await resolve();
+      var lang = (r.voice && r.voice.lang) || state.settings.ttsLang;
+
       if (p) {
-        await p.speak({
+        var options = {
           text: text,
-          lang: state.settings.ttsLang,
+          lang: lang,
           rate: state.settings.ttsRate,
           pitch: 1.0,
           volume: 1.0,
           category: 'playback'
-        });
+        };
+        if (r.index >= 0) options.voice = r.index;
+        await p.speak(options);
       } else {
-        await webSpeak(text);
+        await webSpeak(text, {
+          lang: lang,
+          rate: state.settings.ttsRate,
+          voiceURI: (r.voice && r.voice.voiceURI) || ''
+        });
       }
     }
 
@@ -1163,6 +1381,13 @@
     async function play(fromPage) {
       if (playing) { stop(); return; }
       var start = fromPage || Reader.current;
+
+      try {
+        if (!(await offlineAvailable())) {
+          toast('No hay voz sin conexión. Ajustes → Texto a voz para descargarla.');
+        }
+      } catch (e) { }
+
       playing = true; cancelled = false; curPage = start;
       ui(true, curPage);
 
@@ -1198,7 +1423,15 @@
       ui(false);
     }
 
-    return { play: play, stop: stop, get playing() { return playing; } };
+    return {
+      play: play,
+      stop: stop,
+      voices: voices,
+      resolve: resolve,
+      offlineAvailable: offlineAvailable,
+      reset: function () { voiceCache = null; resolved = null; },
+      get playing() { return playing; }
+    };
   })();
 
   /* ---------------------------------------------------------
