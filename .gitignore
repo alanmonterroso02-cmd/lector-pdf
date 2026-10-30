@@ -17,3 +17,6 @@ tools/*.png
 # sistema
 .DS_Store
 Thumbs.db
+
+dist/
+
