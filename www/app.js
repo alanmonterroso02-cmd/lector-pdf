@@ -751,7 +751,10 @@
       rendered: {},
       renderPending: false,
       current: 1,
-      textCache: {},
+      infoCache: {},
+      hl: null,
+      hlLayer: null,
+      hlToken: 0,
       destroyed: false
     };
 
@@ -770,7 +773,8 @@
       r.isOpen = true;
       r.book = book;
       r.destroyed = false;
-      r.textCache = {};
+      r.infoCache = {};
+      clearHighlight();
       r.rendered = {};
       r.current = book.lastPage || 1;
       r.zoom = state.settings.zoom || 1;
@@ -819,6 +823,7 @@
       if (r.pdf) { try { r.pdf.destroy(); } catch (e) { } }
       r.pdf = null;
       TTS.stop();
+      clearHighlight();
       innerEl.innerHTML = '';
       r.wrappers = [];
       r.rendered = {};
@@ -911,6 +916,7 @@
           if (w && w.rendered) {
             if (w.canvas) { w.canvas.width = 0; w.canvas.height = 0; w.canvas.remove(); }
             if (w.textLayer) w.textLayer.remove();
+            if (r.hl && r.hl.page === num) removeLayer();
             w.canvas = null; w.textLayer = null; w.rendered = false;
             w.el.insertAdjacentHTML('afterbegin', '<div class="ph">' + num + '</div>');
           }
@@ -960,6 +966,9 @@
 
         // capa de texto (selección + copiar) — opcional, nunca bloquea
         try { await buildTextLayer(page, vp, w); } catch (e) { }
+
+        // volver a pintar el subrayado si esta es la página que se está leyendo
+        if (r.hl && r.hl.page === num) redrawHighlight();
       } catch (e) {
         console.warn('render', num, e);
       } finally {
@@ -1104,6 +1113,7 @@
       var nw = r.wrappers[page - 1];
       if (nw) pagesEl.scrollTop = nw.el.offsetTop + rel * nw.height;
       renderVisible();
+      redrawHighlight();
       updateSlider(page);
     }
 
@@ -1146,22 +1156,117 @@
       try { return (await r.pdf.getPageIndex(ref)) + 1; } catch (e) { return null; }
     }
 
-    /* ---------- texto ---------- */
-    async function pageText(num) {
-      if (r.textCache[num]) return r.textCache[num];
+    /* ---------- texto + geometría (necesaria para subrayar) ---------- */
+    async function pageInfo(num) {
+      if (r.infoCache[num]) return r.infoCache[num];
       var page = await r.pdf.getPage(num);
       var tc = await page.getTextContent();
-      var out = '';
+      var text = '';
+      var items = [];
       for (var i = 0; i < tc.items.length; i++) {
         var it = tc.items[i];
-        if (!it.str) continue;
-        out += it.str;
-        if (it.hasEOL) out += '\n';
-        else if (!/\s$/.test(it.str)) out += ' ';
+        var start = text.length;
+        text += it.str;
+        items.push({
+          start: start,
+          end: text.length,
+          str: it.str,
+          transform: it.transform,
+          width: it.width,
+          height: it.height
+        });
+        if (it.hasEOL) text += '\n';
+        else if (!/\s$/.test(it.str)) text += ' ';
       }
-      out = out.replace(/[ \t]+/g, ' ').replace(/\n{3,}/g, '\n\n').trim();
-      r.textCache[num] = out;
-      return out;
+      var info = { text: text, items: items, page: page, ranges: null };
+      r.infoCache[num] = info;
+      return info;
+    }
+
+    async function pageText(num) {
+      try {
+        var info = await pageInfo(num);
+        return info.text;
+      } catch (e) {
+        return '';
+      }
+    }
+
+    /* ---------- subrayado de lo que se está leyendo ---------- */
+    function removeLayer() {
+      if (r.hlLayer && r.hlLayer.parentNode) r.hlLayer.parentNode.removeChild(r.hlLayer);
+      r.hlLayer = null;
+    }
+
+    function clearHighlight() {
+      removeLayer();
+      r.hl = null;
+    }
+
+    async function drawHighlight(pageNum, a, b, doScroll) {
+      if (!r.isOpen || !r.pdf) return;
+      var w = r.wrappers[pageNum - 1];
+      if (!w) return;
+
+      removeLayer();
+      r.hl = { page: pageNum, a: a, b: b };
+
+      var token = ++r.hlToken;
+      var info;
+      try { info = await pageInfo(pageNum); } catch (e) { return; }
+      if (r.destroyed || !r.isOpen || token !== r.hlToken) return;
+
+      var vp = info.page.getViewport({ scale: r.scale });
+      var layer = document.createElement('div');
+      layer.className = 'hl-layer';
+
+      var firstTop = null;
+      for (var i = 0; i < info.items.length; i++) {
+        var it = info.items[i];
+        if (it.end <= a) continue;
+        if (it.start >= b) break;
+        if (!it.str || !it.str.trim()) continue;
+
+        var tx = PDFJS.Util.transform(vp.transform, it.transform);
+        var fh = Math.sqrt(tx[2] * tx[2] + tx[3] * tx[3]);
+        if (!fh || !isFinite(fh)) continue;
+
+        var left = tx[4];
+        var top = tx[5] - fh;
+        var width = (it.width || 0) * vp.scale;
+        if (!width || width < 1 || !isFinite(width)) width = fh * 0.5 * Math.max(1, it.str.length);
+
+        var d = document.createElement('div');
+        d.className = 'hl-rect';
+        d.style.left = left.toFixed(1) + 'px';
+        d.style.top = top.toFixed(1) + 'px';
+        d.style.width = Math.max(3, width).toFixed(1) + 'px';
+        d.style.height = (fh * 1.15).toFixed(1) + 'px';
+        layer.appendChild(d);
+        if (firstTop === null) firstTop = top;
+      }
+
+      if (!layer.childNodes.length) return;
+      w.el.appendChild(layer);
+      r.hlLayer = layer;
+
+      if (doScroll && firstTop !== null) {
+        var topInScroll = w.el.offsetTop + firstTop;
+        var viewTop = pagesEl.scrollTop + 66;
+        var viewBottom = pagesEl.scrollTop + pagesEl.clientHeight - 90;
+        if (topInScroll < viewTop || topInScroll > viewBottom) {
+          var target = Math.max(0, topInScroll - 130);
+          if (typeof pagesEl.scrollTo === 'function') {
+            pagesEl.scrollTo({ top: target, behavior: 'smooth' });
+          } else {
+            pagesEl.scrollTop = target;
+          }
+        }
+      }
+    }
+
+    function redrawHighlight() {
+      if (r.hl) drawHighlight(r.hl.page, r.hl.a, r.hl.b, false);
     }
 
     /* ---------- búsqueda ---------- */
@@ -1209,6 +1314,9 @@
       chapters: chapters,
       search: search,
       pageText: pageText,
+      pageInfo: pageInfo,
+      highlight: function (page, a, b, scroll) { drawHighlight(page, a, b, scroll !== false); },
+      clearHighlight: clearHighlight,
       get current() { return r.current; },
       get numPages() { return r.numPages; },
       get zoom() { return r.zoom; },
@@ -1289,7 +1397,7 @@
       return -1;
     }
 
-    async function resolve() {
+    async function resolveVoice() {
       if (resolved) return resolved;
       var list = await voices();
       var idx = pickIndex(list);
@@ -1328,58 +1436,200 @@
       });
     }
 
-    async function speak(text) {
+    /* ---------- frases de una página (con posiciones para subrayar) ---------- */
+    function sentenceRanges(text, max) {
+      var ranges = [];
+      var last = 0, m;
+      var re = /([.!?…]+)(\s+|$)/g;
+
+      function push(a, b) {
+        while (a < b && /\s/.test(text.charAt(a))) a++;
+        while (b > a && /\s/.test(text.charAt(b - 1))) b--;
+        if (b <= a) return;
+        if (b - a <= max) { ranges.push({ a: a, b: b }); return; }
+        var s = a;
+        while (b - s > max) {
+          var cut = text.lastIndexOf(' ', s + max);
+          if (cut <= s) cut = s + max;
+          ranges.push({ a: s, b: cut });
+          s = cut + 1;
+          while (s < b && /\s/.test(text.charAt(s))) s++;
+        }
+        if (b > s) ranges.push({ a: s, b: b });
+      }
+
+      while ((m = re.exec(text))) {
+        push(last, m.index + m[1].length);
+        last = m.index + m[0].length;
+      }
+      if (last < text.length) push(last, text.length);
+      return ranges;
+    }
+
+    /* ---------- estado de la sesión ---------- */
+    var playing = false, paused = false, stopFlag = false;
+    var sess = { page: 1, sent: 0, total: 0, base: 0 };
+    var bar = null;
+    var abortFn = null;
+    var rangeListener = null;
+    var loopId = 0;
+
+    function speakOnce(text) {
+      return new Promise(function (finish) {
+        var finished = false;
+        function done() {
+          if (finished) return;
+          finished = true;
+          abortFn = null;
+          finish();
+        }
+        abortFn = done;
+
+        resolveVoice().then(function (rv) {
+          var p = plugin();
+          if (p) {
+            var opts = {
+              text: text,
+              lang: (rv.voice && rv.voice.lang) || state.settings.ttsLang,
+              rate: state.settings.ttsRate,
+              pitch: 1.0,
+              volume: 1.0,
+              category: 'playback'
+            };
+            if (rv.index >= 0) opts.voice = rv.index;
+            return p.speak(opts);
+          }
+          return webSpeak(text, {
+            lang: (rv.voice && rv.voice.lang) || state.settings.ttsLang,
+            rate: state.settings.ttsRate,
+            voiceURI: (rv.voice && rv.voice.voiceURI) || ''
+          });
+        }).then(done, done);
+      });
+    }
+
+    function abortCurrent() {
+      var f = abortFn;
+      abortFn = null;
       var p = plugin();
-      var r = await resolve();
-      var lang = (r.voice && r.voice.lang) || state.settings.ttsLang;
+      if (p) { try { p.stop(); } catch (e) { } }
+      if (window.speechSynthesis) { try { window.speechSynthesis.cancel(); } catch (e) { } }
+      if (f) f();
+    }
 
-      if (p) {
-        var options = {
-          text: text,
-          lang: lang,
-          rate: state.settings.ttsRate,
-          pitch: 1.0,
-          volume: 1.0,
-          category: 'playback'
-        };
-        if (r.index >= 0) options.voice = r.index;
-        await p.speak(options);
-      } else {
-        await webSpeak(text, {
-          lang: lang,
-          rate: state.settings.ttsRate,
-          voiceURI: (r.voice && r.voice.voiceURI) || ''
+    /* El motor de Android avisa la palabra que va pronunciando: subrayado fino. */
+    async function attachRange() {
+      if (rangeListener) return;
+      var p = plugin();
+      if (!p || !p.addListener) return;
+      try {
+        rangeListener = await p.addListener('onRangeStart', function (info) {
+          if (!playing || paused || !sess.total) return;
+          var a = sess.base + info.start;
+          var b = sess.base + info.end;
+          if (b > a) Reader.highlight(sess.page, a, b, false);
         });
+      } catch (e) {
+        rangeListener = null;
       }
     }
 
-    function chunk(text, max) {
-      var parts = [], cur = '';
-      var words = text.split(/\s+/);
-      for (var i = 0; i < words.length; i++) {
-        var w = words[i];
-        if (!w) continue;
-        if (cur && (cur.length + 1 + w.length) > max) { parts.push(cur); cur = w; }
-        else cur = cur ? cur + ' ' + w : w;
+    async function loop() {
+      var myId = ++loopId;
+      await attachRange();
+
+      while (playing && !paused && !stopFlag && myId === loopId) {
+        var info;
+        try { info = await Reader.pageInfo(sess.page); } catch (e) { break; }
+        if (myId !== loopId) return;
+
+        if (!info.ranges) info.ranges = sentenceRanges(info.text, 240);
+        var ranges = info.ranges;
+
+        if (!ranges.length) {
+          if (sess.page >= Reader.numPages) break;
+          sess.page++; sess.sent = 0;
+          Reader.goToPage(sess.page, false);
+          continue;
+        }
+
+        if (sess.sent >= ranges.length) {
+          if (sess.page >= Reader.numPages) break;
+          sess.page++; sess.sent = 0;
+          Reader.goToPage(sess.page, false);
+          continue;
+        }
+
+        var rg = ranges[sess.sent];
+        sess.total = ranges.length;
+        sess.base = rg.a;
+
+        updateBar();
+        Reader.highlight(sess.page, rg.a, rg.b, true);
+
+        var txt = info.text.slice(rg.a, rg.b);
+        if (!txt.trim()) { sess.sent++; continue; }
+
+        await speakOnce(txt);
+        if (myId !== loopId || stopFlag) return;
+        if (paused) break;
+
+        sess.sent++;
       }
-      if (cur) parts.push(cur);
-      return parts.filter(function (x) { return x.trim().length > 0; });
+
+      if (myId === loopId && !stopFlag && !paused) finish();
     }
 
-    function ui(show, page) {
+    function finish() {
+      playing = false;
+      paused = false;
+      stopFlag = true;
+      abortCurrent();
+      ui(false);
+      toast('Fin de la lectura');
+    }
+
+    function ui(show) {
       if (bar) { bar.remove(); bar = null; }
       if (!show) return;
       bar = document.createElement('div');
       bar.className = 'tts-bar';
       bar.innerHTML =
-        '<div class="tts-info"><b>Leyendo en voz alta</b><small id="tts-sub">Página ' + page + '</small></div>' +
+        '<div class="tts-info"><b id="tts-title">Leyendo en voz alta</b><small id="tts-sub"></small></div>' +
+        '<button id="tts-prev" title="Frase anterior">⏮</button>' +
+        '<button id="tts-play" title="Pausar">⏸</button>' +
+        '<button id="tts-next" title="Frase siguiente">⏭</button>' +
         '<button id="tts-stop" title="Detener">■</button>';
+
       $('#reader').appendChild(bar);
+      bar.querySelector('#tts-prev').addEventListener('click', function () { prevSentence(); });
+      bar.querySelector('#tts-play').addEventListener('click', function () { toggle(); });
+      bar.querySelector('#tts-next').addEventListener('click', function () { nextSentence(); });
       bar.querySelector('#tts-stop').addEventListener('click', function () { stop(); toast('Lectura detenida'); });
+      updateBar();
+    }
+
+    function updateBar() {
+      if (!bar) return;
+      var sub = bar.querySelector('#tts-sub');
+      var btn = bar.querySelector('#tts-play');
+      var title = bar.querySelector('#tts-title');
+      if (sub) {
+        sub.textContent = 'Página ' + sess.page +
+          (sess.total ? ' · frase ' + Math.min(sess.sent + 1, sess.total) + ' de ' + sess.total : '');
+      }
+      if (btn) {
+        btn.textContent = paused ? '▶' : '⏸';
+        btn.setAttribute('title', paused ? 'Reanudar' : 'Pausar');
+      }
+      if (title) title.textContent = paused ? 'En pausa' : 'Leyendo en voz alta';
     }
 
     async function play(fromPage) {
-      if (playing) { stop(); return; }
+      if (playing) {
+        if (paused) resume();
+        return;
+      }
       var start = fromPage || Reader.current;
 
       try {
@@ -1388,49 +1638,109 @@
         }
       } catch (e) { }
 
-      playing = true; cancelled = false; curPage = start;
-      ui(true, curPage);
+      sess = { page: start, sent: 0, total: 0, base: 0 };
+      playing = true;
+      paused = false;
+      stopFlag = false;
+      ui(true);
+      loop();
+    }
 
-      while (!cancelled && curPage <= Reader.numPages) {
-        var text = '';
-        try { text = await Reader.pageText(curPage); } catch (e) { }
-        if (cancelled) break;
+    function pause() {
+      if (!playing || paused) return;
+      paused = true;
+      loopId++;
+      abortCurrent();
+      updateBar();
+    }
 
-        if (text && text.length > 2) {
-          var parts = chunk(text, 2800);
-          for (var i = 0; i < parts.length && !cancelled; i++) {
-            if (bar) bar.querySelector('#tts-sub').textContent = 'Página ' + curPage + ' · parte ' + (i + 1) + '/' + parts.length;
-            try { await speak(parts[i]); } catch (e) { console.warn(e); }
-          }
-        }
+    function resume() {
+      if (!playing) { play(); return; }
+      if (!paused) return;
+      paused = false;
+      updateBar();
+      loop();
+    }
 
-        if (cancelled) break;
-        curPage++;
-        if (curPage <= Reader.numPages) {
-          Reader.goToPage(curPage, false);
-          if (bar) bar.querySelector('#tts-sub').textContent = 'Página ' + curPage;
-        }
-      }
-      stop();
+    function toggle() {
+      if (!playing) play();
+      else if (paused) resume();
+      else pause();
     }
 
     function stop() {
-      cancelled = true;
       playing = false;
-      var p = plugin();
-      if (p) { try { p.stop(); } catch (e) { } }
-      if (window.speechSynthesis) { try { window.speechSynthesis.cancel(); } catch (e) { } }
+      paused = false;
+      stopFlag = true;
+      loopId++;
+      abortCurrent();
       ui(false);
+      Reader.clearHighlight();
+      sess = { page: 1, sent: 0, total: 0, base: 0 };
     }
+
+    async function moveBy(delta) {
+      if (!playing) return;
+
+      var info;
+      try { info = await Reader.pageInfo(sess.page); } catch (e) { return; }
+      if (!info.ranges) info.ranges = sentenceRanges(info.text, 240);
+      var ranges = info.ranges;
+
+      if (delta > 0) {
+        if (sess.sent + 1 < ranges.length) sess.sent++;
+        else if (sess.page < Reader.numPages) {
+          sess.page++; sess.sent = 0;
+          Reader.goToPage(sess.page, false);
+          info = await Reader.pageInfo(sess.page);
+          if (!info.ranges) info.ranges = sentenceRanges(info.text, 240);
+          ranges = info.ranges;
+        } else { stop(); return; }
+      } else {
+        if (sess.sent > 0) sess.sent--;
+        else if (sess.page > 1) {
+          sess.page--;
+          Reader.goToPage(sess.page, false);
+          info = await Reader.pageInfo(sess.page);
+          if (!info.ranges) info.ranges = sentenceRanges(info.text, 240);
+          ranges = info.ranges;
+          sess.sent = Math.max(0, ranges.length - 1);
+        } else sess.sent = 0;
+      }
+
+      sess.total = ranges.length;
+      loopId++;
+      abortCurrent();
+
+      if (playing && !paused) {
+        loop();
+      } else {
+        var rg = ranges[sess.sent];
+        if (rg) {
+          sess.base = rg.a;
+          Reader.highlight(sess.page, rg.a, rg.b, true);
+        }
+        updateBar();
+      }
+    }
+
+    function nextSentence() { moveBy(1); }
+    function prevSentence() { moveBy(-1); }
 
     return {
       play: play,
+      pause: pause,
+      resume: resume,
+      toggle: toggle,
       stop: stop,
+      nextSentence: nextSentence,
+      prevSentence: prevSentence,
       voices: voices,
-      resolve: resolve,
+      resolve: resolveVoice,
       offlineAvailable: offlineAvailable,
       reset: function () { voiceCache = null; resolved = null; },
-      get playing() { return playing; }
+      get playing() { return playing; },
+      get paused() { return paused; }
     };
   })();
 
@@ -1648,7 +1958,7 @@
     $('#r-toc').addEventListener('click', openTOC);
     $('#r-search').addEventListener('click', openSearch);
     $('#r-more').addEventListener('click', openReaderMenu);
-    $('#r-tts').addEventListener('click', function () { TTS.play(); });
+    $('#r-tts').addEventListener('click', function () { TTS.toggle(); });
 
     // atajos de teclado (útil al probar en escritorio)
     document.addEventListener('keydown', function (e) {

@@ -17,6 +17,8 @@ Hecha con HTML/CSS/JS + [pdf.js] y empaquetada con [Capacitor].
 - **Búsqueda** de palabras o frases dentro del libro, con número de coincidencias por página.
 - **Leer en voz alta (TTS)** con voz del sistema, velocidad ajustable y avance automático de página.
 - **TTS sin conexión**: la app detecta las voces instaladas, prefiere una **voz local** y avisa si el teléfono solo tiene voces online. En Ajustes → **Texto a voz** puedes ver qué voces funcionan sin internet, elegir una y abrir la pantalla de Android para descargar más.
+- **Subrayado en vivo**: mientras se lee en voz alta, la app resalta la frase (y la palabra) que está pronunciando, y hace scroll sola para seguirla.
+- **Controles de voz**: pausa/reanudar, frase anterior, frase siguiente y detener; velocidad ajustable.
 - **Guarda el progreso**: al volver a abrir el libro continúa en la página donde lo dejaste.
 - Selección y copia de texto (capa de texto de pdf.js).
 - Sin anuncios, sin permisos raros, sin internet.
