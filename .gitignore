@@ -1,0 +1,19 @@
+# dependencias
+node_modules/
+
+# compilación Android
+android/.gradle/
+android/build/
+android/app/build/
+android/capacitor-cordova-android-plugins/build/
+android/app/src/main/assets/public/
+android/app/src/main/assets/capacitor.config.json
+android/local.properties
+
+# archivos temporales de prueba
+tools/sample.pdf
+tools/*.png
+
+# sistema
+.DS_Store
+Thumbs.db

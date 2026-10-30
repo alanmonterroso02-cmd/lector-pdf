@@ -1,0 +1,14 @@
+{
+  "appId": "sv.com.monterroso.lectorpdf",
+  "appName": "Lector PDF",
+  "webDir": "www",
+  "android": {
+    "allowMixedContent": false,
+    "backgroundColor": "#f6f4ef"
+  },
+  "plugins": {
+    "SplashScreen": {
+      "launchAutoHide": true
+    }
+  }
+}
